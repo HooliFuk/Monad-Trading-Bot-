@@ -13,6 +13,7 @@ const ERC20_ABI = [
 ];
 const WMON_ABI = [
   'function deposit() payable',
+  'function withdraw(uint256 amount)',
   'function balanceOf(address) view returns (uint256)'
 ];
 
@@ -26,13 +27,34 @@ class Scanner {
     this.isTrading = false;
   }
 
+  async _getExecutableSize() {
+    if (!this.signer) return SETTINGS.maxTradeSize;
+    try {
+      const wallet = await this.signer.getAddress();
+      const [nativeBal, wmonToken] = await Promise.all([
+        this.provider.getBalance(wallet),
+        new ethers.Contract(TOKENS.WMON.address, ERC20_ABI, this.provider).balanceOf(wallet)
+      ]);
+
+      const gasReserve = ethers.utils.parseEther("2.0"); // Keep 2 MON for gas
+      const totalMonWei = nativeBal.add(wmonToken);
+      
+      if (totalMonWei.lte(gasReserve)) return 0;
+
+      const availMon = parseFloat(ethers.utils.formatEther(totalMonWei.sub(gasReserve)));
+      return Math.min(SETTINGS.maxTradeSize, Math.max(1, parseFloat(availMon.toFixed(2))));
+    } catch {
+      return SETTINGS.maxTradeSize;
+    }
+  }
+
   async _ensureAllowance(tokenAddr, spender, amount) {
     const token = new ethers.Contract(tokenAddr, ERC20_ABI, this.signer);
     const walletAddress = await this.signer.getAddress();
     const allowance = await token.allowance(walletAddress, spender);
     
     if (allowance.lt(amount)) {
-      logger.trade(`Approving token ${tokenAddr} for spender ${spender}...`);
+      logger.trade(`Approving token ${tokenAddr.slice(0,8)}...`);
       const tx = await token.approve(spender, ethers.constants.MaxUint256);
       await tx.wait();
       logger.success(`Approval confirmed!`);
@@ -41,8 +63,13 @@ class Scanner {
 
   async scan() {
     if (this.isTrading) return;
-    const size = SETTINGS.maxTradeSize;
-    
+
+    const size = await this._getExecutableSize();
+    if (size <= 0) {
+      logger.warn('Insufficient MON balance (must have > 2 MON for gas reserve)');
+      return;
+    }
+
     for (const pair of PAIRS) {
       try {
         const [kuruQ, zeroXQ] = await Promise.all([
@@ -50,30 +77,28 @@ class Scanner {
           this.zeroX.getPrice(pair.tokenIn, pair.tokenOut, size),
         ]);
         
-        if (!kuruQ || !zeroXQ) {
-          continue;
-        }
+        if (!kuruQ || !zeroXQ) continue;
 
         const gapA = ((zeroXQ.price - kuruQ.askPrice) / kuruQ.askPrice) * 100;
         const gapB = ((kuruQ.bidPrice - zeroXQ.price) / zeroXQ.price) * 100;
 
-        logger.info(`${pair.label} | Gaps: A:${gapA.toFixed(2)}% B:${gapB.toFixed(2)}%`);
+        logger.info(`${pair.label} [Size: ${size} MON] | Gaps: A:${gapA.toFixed(2)}% B:${gapB.toFixed(2)}%`);
 
         if (gapA >= SETTINGS.minArbPercent) {
           this.isTrading = true;
-          logger.opportunity(`Arb Opportunity (Dir A): ${gapA.toFixed(2)}%`);
+          logger.opportunity(`⚡ Arb Found (Dir A: Buy Kuru / Sell 0x): +${gapA.toFixed(2)}%`);
           await this._executeDirA(pair, kuruQ, size);
           this.isTrading = false;
-          await sleep(15000);
+          await sleep(10000);
         } else if (gapB >= SETTINGS.minArbPercent) {
           this.isTrading = true;
-          logger.opportunity(`Arb Opportunity (Dir B): ${gapB.toFixed(2)}%`);
+          logger.opportunity(`⚡ Arb Found (Dir B: Sell Kuru / Buy 0x): +${gapB.toFixed(2)}%`);
           await this._executeDirB(pair, kuruQ, size);
           this.isTrading = false;
-          await sleep(15000);
+          await sleep(10000);
         }
       } catch (err) {
-        logger.error(`Scan error on ${pair.label}: ${err.message}`);
+        logger.error(`Scan error: ${err.message.slice(0, 70)}`);
       }
     }
   }
@@ -86,7 +111,7 @@ class Scanner {
 
       await this._ensureAllowance(pair.tokenOut.address, pair.kuruMarket, usdcWei);
 
-      logger.trade(`Leg 1: Kuru Buy... Spending ${usdcToSpend} USDC`);
+      logger.trade(`[Leg 1] Kuru Market Buy: Spending ${usdcToSpend} USDC...`);
       const params = await this.kuru._getParams(pair.kuruMarket);
       const tx = await KuruSdk.IOC.placeMarket(this.signer, pair.kuruMarket, params, {
         approveTokens: false, 
@@ -99,36 +124,32 @@ class Scanner {
       });
       
       if (tx && tx.hash) {
-        logger.info(`Kuru Buy Tx sent: ${tx.hash}`);
+        logger.info(`Kuru Tx Hash: ${tx.hash}`);
         await tx.wait();
       }
 
+      // Wrap acquired MON to WMON for 0x Leg 2
       const monBal = await this.provider.getBalance(wallet);
-      const gasBuffer = ethers.utils.parseEther("5");
-      
+      const gasBuffer = ethers.utils.parseEther("1.5");
       if (monBal.gt(gasBuffer)) {
         const wrapAmt = monBal.sub(gasBuffer);
-        logger.trade(`Wrapping ${ethers.utils.formatEther(wrapAmt)} MON...`);
         const wmon = new ethers.Contract(TOKENS.WMON.address, WMON_ABI, this.signer);
-        const wrapTx = await wmon.deposit({ value: wrapAmt });
-        await wrapTx.wait();
+        await (await wmon.deposit({ value: wrapAmt })).wait();
       }
 
       const wmonToken = new ethers.Contract(TOKENS.WMON.address, ERC20_ABI, this.signer);
       const currentWmon = await wmonToken.balanceOf(wallet);
 
-      if (currentWmon.eq(0)) {
-        throw new Error("No WMON balance available to sell on 0x");
-      }
+      if (currentWmon.eq(0)) throw new Error("No WMON received to execute Leg 2");
 
-      logger.trade(`Leg 2: 0x Sell... Selling ${ethers.utils.formatEther(currentWmon)} WMON`);
+      logger.trade(`[Leg 2] 0x Sell: Swapping ${ethers.utils.formatEther(currentWmon)} WMON for USDC...`);
       await this.zeroX.executeSwap(pair.tokenIn, pair.tokenOut, ethers.utils.formatEther(currentWmon), this.signer);
       
       this.stats.trades++;
-      logger.success(`✅ Cycle Complete | Total Successes: ${this.stats.trades}`);
+      logger.success(`🎉 Arbitrage Cycle Complete! Success Count: ${this.stats.trades}`);
     } catch (err) { 
       this.stats.failures++;
-      logger.error(`Dir A Execution Failed: ${err.message}`); 
+      logger.error(`Dir A Failed: ${err.message.slice(0, 80)}`); 
     }
   }
 
@@ -141,17 +162,13 @@ class Scanner {
       const currentWmon = await wmon.balanceOf(wallet);
       if (currentWmon.lt(monWei)) {
         const wrapNeeded = monWei.sub(currentWmon);
-        const monBal = await this.provider.getBalance(wallet);
-        if (monBal.lt(wrapNeeded.add(ethers.utils.parseEther("2")))) {
-          throw new Error("Insufficient native MON to wrap for trade.");
-        }
         logger.trade(`Wrapping ${ethers.utils.formatEther(wrapNeeded)} MON...`);
         await (await wmon.deposit({ value: wrapNeeded })).wait();
       }
 
       await this._ensureAllowance(TOKENS.WMON.address, pair.kuruMarket, monWei);
       
-      logger.trade(`Leg 1: Kuru Sell... Selling ${size} MON`);
+      logger.trade(`[Leg 1] Kuru Market Sell: Selling ${size} MON...`);
       const params = await this.kuru._getParams(pair.kuruMarket);
       const tx = await KuruSdk.IOC.placeMarket(this.signer, pair.kuruMarket, params, {
         approveTokens: false, 
@@ -163,30 +180,28 @@ class Scanner {
         txOptions: { value: 0 }
       });
       if (tx && tx.hash) {
-        logger.info(`Kuru Sell Tx sent: ${tx.hash}`);
+        logger.info(`Kuru Tx Hash: ${tx.hash}`);
         await tx.wait();
       }
 
       const usdc = new ethers.Contract(pair.tokenOut.address, ERC20_ABI, this.signer);
       const usdcBal = await usdc.balanceOf(wallet);
 
-      if (usdcBal.eq(0)) {
-        throw new Error("No USDC received from Kuru for 0x Leg 2");
-      }
+      if (usdcBal.eq(0)) throw new Error("No USDC balance received for Leg 2");
 
-      logger.trade(`Leg 2: 0x Buy... Swapping ${ethers.utils.formatUnits(usdcBal, 6)} USDC`);
+      logger.trade(`[Leg 2] 0x Buy: Swapping ${ethers.utils.formatUnits(usdcBal, 6)} USDC for WMON...`);
       await this.zeroX.executeSwap(pair.tokenOut, pair.tokenIn, ethers.utils.formatUnits(usdcBal, 6), this.signer);
 
       this.stats.trades++;
-      logger.success(`✅ Cycle Complete | Total Successes: ${this.stats.trades}`);
+      logger.success(`🎉 Arbitrage Cycle Complete! Success Count: ${this.stats.trades}`);
     } catch (err) { 
       this.stats.failures++;
-      logger.error(`Dir B Execution Failed: ${err.message}`); 
+      logger.error(`Dir B Failed: ${err.message.slice(0, 80)}`); 
     }
   }
 
   printStats() {
-    logger.info(`📊 Bot Metrics | Executed Cycles: ${this.stats.trades} | Failed Cycles: ${this.stats.failures}`);
+    logger.info(`📊 Summary | Cycles Executed: ${this.stats.trades} | Failed: ${this.stats.failures}`);
   }
 }
 
