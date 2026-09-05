@@ -27,27 +27,6 @@ class Scanner {
     this.isTrading = false;
   }
 
-  async _getExecutableSize() {
-    if (!this.signer) return SETTINGS.maxTradeSize;
-    try {
-      const wallet = await this.signer.getAddress();
-      const [nativeBal, wmonToken] = await Promise.all([
-        this.provider.getBalance(wallet),
-        new ethers.Contract(TOKENS.WMON.address, ERC20_ABI, this.provider).balanceOf(wallet)
-      ]);
-
-      const gasReserve = ethers.utils.parseEther("2.0"); // Keep 2 MON for gas
-      const totalMonWei = nativeBal.add(wmonToken);
-      
-      if (totalMonWei.lte(gasReserve)) return 0;
-
-      const availMon = parseFloat(ethers.utils.formatEther(totalMonWei.sub(gasReserve)));
-      return Math.min(SETTINGS.maxTradeSize, Math.max(1, parseFloat(availMon.toFixed(2))));
-    } catch {
-      return SETTINGS.maxTradeSize;
-    }
-  }
-
   async _ensureAllowance(tokenAddr, spender, amount) {
     const token = new ethers.Contract(tokenAddr, ERC20_ABI, this.signer);
     const walletAddress = await this.signer.getAddress();
@@ -61,12 +40,49 @@ class Scanner {
     }
   }
 
+  // Ensure all capital is in native MON before sizing
+  async _normalizeBalances() {
+    if (!this.signer) return;
+    try {
+      const wallet = await this.signer.getAddress();
+      const wmon = new ethers.Contract(TOKENS.WMON.address, WMON_ABI, this.signer);
+      const wmonBal = await wmon.balanceOf(wallet);
+      
+      if (wmonBal.gt(ethers.utils.parseEther("0.1"))) {
+        logger.trade(`Auto-unwrapping ${ethers.utils.formatEther(wmonBal)} WMON to native MON...`);
+        const tx = await wmon.withdraw(wmonBal, { gasLimit: 150000 });
+        await tx.wait();
+        logger.success(`Unwrapped to native MON!`);
+      }
+    } catch (err) {
+      logger.warn(`Normalize balance error: ${err.message.slice(0, 60)}`);
+    }
+  }
+
+  async _getExecutableSize() {
+    if (!this.signer) return SETTINGS.maxTradeSize;
+    try {
+      const wallet = await this.signer.getAddress();
+      const nativeBal = await this.provider.getBalance(wallet);
+      const gasReserve = ethers.utils.parseEther("3.0"); // Keep 3 MON for gas
+      
+      if (nativeBal.lte(gasReserve)) return 0;
+
+      const availMon = parseFloat(ethers.utils.formatEther(nativeBal.sub(gasReserve)));
+      return Math.min(SETTINGS.maxTradeSize, Math.max(1, Math.floor(availMon)));
+    } catch {
+      return SETTINGS.maxTradeSize;
+    }
+  }
+
   async scan() {
     if (this.isTrading) return;
 
+    await this._normalizeBalances();
     const size = await this._getExecutableSize();
+
     if (size <= 0) {
-      logger.warn('Insufficient MON balance (must have > 2 MON for gas reserve)');
+      logger.warn('Insufficient MON balance for trading (need > 3 MON for gas reserve)');
       return;
     }
 
@@ -79,14 +95,16 @@ class Scanner {
         
         if (!kuruQ || !zeroXQ) continue;
 
+        // Gap A: 0x Price > Kuru Price -> Sell on 0x, Buy on Kuru
         const gapA = ((zeroXQ.price - kuruQ.askPrice) / kuruQ.askPrice) * 100;
+        // Gap B: Kuru Price > 0x Price -> Sell on Kuru, Buy on 0x
         const gapB = ((kuruQ.bidPrice - zeroXQ.price) / zeroXQ.price) * 100;
 
         logger.info(`${pair.label} [Size: ${size} MON] | Gaps: A:${gapA.toFixed(2)}% B:${gapB.toFixed(2)}%`);
 
         if (gapA >= SETTINGS.minArbPercent) {
           this.isTrading = true;
-          logger.opportunity(`⚡ Arb Found (Dir A: Buy Kuru / Sell 0x): +${gapA.toFixed(2)}%`);
+          logger.opportunity(`⚡ Arb Found (Dir A: Sell 0x / Buy Kuru): +${gapA.toFixed(2)}%`);
           await this._executeDirA(pair, kuruQ, size);
           this.isTrading = false;
           await sleep(10000);
@@ -103,15 +121,34 @@ class Scanner {
     }
   }
 
+  // Dir A: Wrap MON -> Sell 0x -> Buy Kuru -> Native MON
   async _executeDirA(pair, kuruQ, size) {
     try {
       const wallet = await this.signer.getAddress();
-      const usdcToSpend = (size * kuruQ.askPrice).toFixed(6);
-      const usdcWei = ethers.utils.parseUnits(usdcToSpend, 6);
+      const wmon = new ethers.Contract(TOKENS.WMON.address, WMON_ABI, this.signer);
+      const usdc = new ethers.Contract(pair.tokenOut.address, ERC20_ABI, this.signer);
+      const monWei = ethers.utils.parseEther(size.toString());
 
-      await this._ensureAllowance(pair.tokenOut.address, pair.kuruMarket, usdcWei);
+      // 1. Wrap exact size to WMON for 0x
+      logger.trade(`Wrapping ${size} MON to WMON for 0x...`);
+      await (await wmon.deposit({ value: monWei })).wait();
 
-      logger.trade(`[Leg 1] Kuru Market Buy: Spending ${usdcToSpend} USDC...`);
+      // 2. Leg 1: Sell WMON on 0x -> Receive USDC
+      const usdcBalBefore = await usdc.balanceOf(wallet);
+      logger.trade(`[Leg 1] 0x Sell: Swapping ${size} WMON for USDC...`);
+      await this.zeroX.executeSwap(pair.tokenIn, pair.tokenOut, size.toString(), this.signer);
+      
+      const usdcBalAfter = await usdc.balanceOf(wallet);
+      const usdcReceived = usdcBalAfter.sub(usdcBalBefore);
+      if (usdcReceived.eq(0)) throw new Error("No USDC received from 0x Leg 1");
+
+      const usdcToSpend = ethers.utils.formatUnits(usdcReceived, 6);
+      logger.info(`Received ${usdcToSpend} USDC from 0x`);
+
+      // 3. Leg 2: Buy MON on Kuru with USDC
+      await this._ensureAllowance(pair.tokenOut.address, pair.kuruMarket, usdcReceived);
+
+      logger.trade(`[Leg 2] Kuru Buy: Spending ${usdcToSpend} USDC for MON...`);
       const params = await this.kuru._getParams(pair.kuruMarket);
       const tx = await KuruSdk.IOC.placeMarket(this.signer, pair.kuruMarket, params, {
         approveTokens: false, 
@@ -128,23 +165,6 @@ class Scanner {
         await tx.wait();
       }
 
-      // Wrap acquired MON to WMON for 0x Leg 2
-      const monBal = await this.provider.getBalance(wallet);
-      const gasBuffer = ethers.utils.parseEther("1.5");
-      if (monBal.gt(gasBuffer)) {
-        const wrapAmt = monBal.sub(gasBuffer);
-        const wmon = new ethers.Contract(TOKENS.WMON.address, WMON_ABI, this.signer);
-        await (await wmon.deposit({ value: wrapAmt })).wait();
-      }
-
-      const wmonToken = new ethers.Contract(TOKENS.WMON.address, ERC20_ABI, this.signer);
-      const currentWmon = await wmonToken.balanceOf(wallet);
-
-      if (currentWmon.eq(0)) throw new Error("No WMON received to execute Leg 2");
-
-      logger.trade(`[Leg 2] 0x Sell: Swapping ${ethers.utils.formatEther(currentWmon)} WMON for USDC...`);
-      await this.zeroX.executeSwap(pair.tokenIn, pair.tokenOut, ethers.utils.formatEther(currentWmon), this.signer);
-      
       this.stats.trades++;
       logger.success(`🎉 Arbitrage Cycle Complete! Success Count: ${this.stats.trades}`);
     } catch (err) { 
@@ -153,22 +173,16 @@ class Scanner {
     }
   }
 
+  // Dir B: Sell Native MON on Kuru -> Buy WMON on 0x -> Unwrap WMON
   async _executeDirB(pair, kuruQ, size) {
     try {
       const wallet = await this.signer.getAddress();
+      const usdc = new ethers.Contract(pair.tokenOut.address, ERC20_ABI, this.signer);
       const wmon = new ethers.Contract(TOKENS.WMON.address, WMON_ABI, this.signer);
-      const monWei = ethers.utils.parseEther(size.toString());
 
-      const currentWmon = await wmon.balanceOf(wallet);
-      if (currentWmon.lt(monWei)) {
-        const wrapNeeded = monWei.sub(currentWmon);
-        logger.trade(`Wrapping ${ethers.utils.formatEther(wrapNeeded)} MON...`);
-        await (await wmon.deposit({ value: wrapNeeded })).wait();
-      }
-
-      await this._ensureAllowance(TOKENS.WMON.address, pair.kuruMarket, monWei);
-      
-      logger.trade(`[Leg 1] Kuru Market Sell: Selling ${size} MON...`);
+      // 1. Leg 1: Sell Native MON on Kuru (Kuru SDK attaches value automatically)
+      const usdcBalBefore = await usdc.balanceOf(wallet);
+      logger.trade(`[Leg 1] Kuru Market Sell: Selling ${size} MON for USDC...`);
       const params = await this.kuru._getParams(pair.kuruMarket);
       const tx = await KuruSdk.IOC.placeMarket(this.signer, pair.kuruMarket, params, {
         approveTokens: false, 
@@ -176,21 +190,31 @@ class Scanner {
         isBuy: false,
         minAmountOut: (size * kuruQ.bidPrice * 0.98).toFixed(6),
         isMargin: false, 
-        fillOrKill: false,
-        txOptions: { value: 0 }
+        fillOrKill: false
       });
       if (tx && tx.hash) {
         logger.info(`Kuru Tx Hash: ${tx.hash}`);
         await tx.wait();
       }
 
-      const usdc = new ethers.Contract(pair.tokenOut.address, ERC20_ABI, this.signer);
-      const usdcBal = await usdc.balanceOf(wallet);
+      const usdcBalAfter = await usdc.balanceOf(wallet);
+      const usdcReceived = usdcBalAfter.sub(usdcBalBefore);
+      if (usdcReceived.eq(0)) throw new Error("No USDC received from Kuru Leg 1");
 
-      if (usdcBal.eq(0)) throw new Error("No USDC balance received for Leg 2");
+      const usdcToSpend = ethers.utils.formatUnits(usdcReceived, 6);
+      logger.info(`Received ${usdcToSpend} USDC from Kuru`);
 
-      logger.trade(`[Leg 2] 0x Buy: Swapping ${ethers.utils.formatUnits(usdcBal, 6)} USDC for WMON...`);
-      await this.zeroX.executeSwap(pair.tokenOut, pair.tokenIn, ethers.utils.formatUnits(usdcBal, 6), this.signer);
+      // 2. Leg 2: Buy WMON on 0x with USDC
+      logger.trade(`[Leg 2] 0x Buy: Swapping ${usdcToSpend} USDC for WMON...`);
+      await this.zeroX.executeSwap(pair.tokenOut, pair.tokenIn, usdcToSpend, this.signer);
+
+      // 3. Unwrap received WMON back to Native MON
+      const wmonBal = await wmon.balanceOf(wallet);
+      if (wmonBal.gt(0)) {
+        logger.trade(`Unwrapping ${ethers.utils.formatEther(wmonBal)} WMON back to Native MON...`);
+        const unwrapTx = await wmon.withdraw(wmonBal, { gasLimit: 150000 });
+        await unwrapTx.wait();
+      }
 
       this.stats.trades++;
       logger.success(`🎉 Arbitrage Cycle Complete! Success Count: ${this.stats.trades}`);
