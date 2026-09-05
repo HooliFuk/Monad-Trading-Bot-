@@ -1,20 +1,15 @@
-// ============================================================
-//  helpers.js — Math utilities (ethers v5)
-// ============================================================
-
-const { ethers } = require('ethers');
+﻿const { ethers } = require('ethers');
 
 function toWei(amount, decimals = 18) {
-  return ethers.utils.parseUnits(amount.toString(), decimals);
+  const str = typeof amount === 'number' ? amount.toFixed(decimals) : amount.toString();
+  return ethers.utils.parseUnits(str, decimals);
 }
 
 function fromWei(amount, decimals = 18) {
   return parseFloat(ethers.utils.formatUnits(amount, decimals));
 }
 
-// Calculate arbitrage profit
-// BUG FIX: removed Math.abs() — negative profit must show as negative
-function calcProfit(buyPrice, sellPrice, size, gasCostUSD = 0.004) {
+function calcProfit(buyPrice, sellPrice, size, gasCostUSD = 0.02) {
   const cost   = size * buyPrice;
   const income = size * sellPrice;
   const gross  = income - cost;
@@ -22,14 +17,12 @@ function calcProfit(buyPrice, sellPrice, size, gasCostUSD = 0.004) {
   return {
     grossProfit:   gross,
     netProfit:     net,
-    profitPercent: (gross / cost) * 100,
+    profitPercent: cost > 0 ? (gross / cost) * 100 : 0,
     gasCostUSD,
     isProfitable:  net > 0,
   };
 }
 
-// BUG FIX: show sign so losses are visible as negative numbers
-// "$0.0012" = profit,  "-$0.0288" = loss
 function fmtUSD(n) {
   if (n < 0) return `-$${Math.abs(n).toFixed(4)}`;
   return `$${n.toFixed(4)}`;
