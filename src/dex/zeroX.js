@@ -1,19 +1,10 @@
-// ============================================================
-//  zeroX.js — 0x Swap API v2 for Monad (fixed)
-//
-//  Key fix: use quote.allowanceTarget (not hardcoded address)
-//  and quote.transaction.to (not hardcoded router)
-//  Per 0x docs: "Developers are strongly advised not to
-//  hardcode this address. Use the value returned by transaction.to"
-// ============================================================
-
-const axios      = require('axios');
+﻿const axios      = require('axios');
 const { ethers } = require('ethers');
 const logger     = require('../utils/logger');
 const { toWei, fromWei } = require('../utils/helpers');
 
 const CHAIN_ID   = 143;
-const SLIPPAGE   = 500; // 5% in basis points
+const SLIPPAGE   = 10; // 0.1% strict slippage (10 bps)
 
 const ERC20_ABI = [
   'function approve(address spender, uint256 amount) returns (bool)',
@@ -35,7 +26,7 @@ class ZeroX {
   _addr(a) { return ethers.utils.getAddress(a); }
 
   async getPrice(tokenIn, tokenOut, amountIn) {
-    if (!this.apiKey) { logger.warn('0x: No API key'); return null; }
+    if (!this.apiKey) return null;
     try {
       const res = await axios.get(`${this.baseUrl}/swap/allowance-holder/price`, {
         params: {
@@ -51,8 +42,6 @@ class ZeroX {
       const amountOut = fromWei(res.data.buyAmount, tokenOut.decimals);
       return { dex: this.name, tokenIn: tokenIn.symbol, tokenOut: tokenOut.symbol, amountIn, amountOut, price: amountOut / amountIn };
     } catch (err) {
-      const detail = err.response?.data?.reason || JSON.stringify(err.response?.data || err.message).slice(0,100);
-      logger.warn(`0x price ${tokenIn.symbol}→${tokenOut.symbol} (${err.response?.status}): ${detail}`);
       return null;
     }
   }
@@ -74,8 +63,6 @@ class ZeroX {
       });
       return res.data;
     } catch (err) {
-      const detail = err.response?.data?.reason || err.message;
-      logger.warn(`0x quote: ${String(detail).slice(0,100)}`);
       return null;
     }
   }
@@ -86,7 +73,6 @@ class ZeroX {
     const walletAddr  = await signer.getAddress();
     const amountInWei = toWei(amountIn, tokenIn.decimals);
 
-    // FIX: use allowanceTarget from quote, not hardcoded address
     const approvalTarget = quote.allowanceTarget || quote.issues?.allowance?.spender;
     if (approvalTarget) {
       const token     = new ethers.Contract(this._addr(tokenIn.address), ERC20_ABI, signer);
@@ -99,28 +85,25 @@ class ZeroX {
       }
     }
 
-    // FIX: use transaction.to from quote (not hardcoded router)
     const tx = quote.transaction;
     const txResp = await signer.sendTransaction({
-      to:       tx.to,       // dynamic — from quote
+      to:       tx.to,
       data:     tx.data,
       value:    ethers.BigNumber.from(tx.value || '0'),
       gasLimit: ethers.BigNumber.from(tx.gas  || '500000'),
     });
 
-    logger.trade(`0x: Tx sent: ${txResp.hash}`);
+    logger.trade(`0x Tx Sent: ${txResp.hash}`);
     const receipt = await txResp.wait();
 
     if (receipt.status === 0) throw new Error(`0x: Reverted (${receipt.transactionHash})`);
-
-    logger.success(`0x: Confirmed — ${receipt.transactionHash}`);
     return receipt;
   }
 
   async executeSwap(tokenIn, tokenOut, amountIn, signer) {
     const walletAddr = await signer.getAddress();
-    logger.trade(`0x: ${amountIn} ${tokenIn.symbol} → ${tokenOut.symbol}`);
     const quote = await this.getQuote(tokenIn, tokenOut, amountIn, walletAddr);
+    if (!quote) throw new Error('0x: Could not fetch executable quote');
     return this.executeSwapWithQuote(quote, tokenIn, amountIn, signer);
   }
 }

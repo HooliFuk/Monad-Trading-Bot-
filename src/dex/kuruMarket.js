@@ -1,4 +1,4 @@
-const KuruSdk = require('@kuru-labs/kuru-sdk');
+﻿const KuruSdk = require('@kuru-labs/kuru-sdk');
 
 class KuruMarket {
   constructor(provider) {
@@ -14,26 +14,21 @@ class KuruMarket {
     return params;
   }
 
-  async getQuote(marketAddress, label) {
+  async getQuote(marketAddress, label, actualSize = 30) {
     try {
       const params = await this._getParams(marketAddress);
+      const tradeSize = parseFloat(actualSize);
 
-      // Get minimum size and probe size
-      const sizePrecision = Math.pow(10, Math.round(Math.log10(parseFloat(params.sizePrecision.toString()))));
-      const minSize = parseFloat(params.minSize.toString()) / sizePrecision;
-      const tradeSize = Math.max(10, minSize * 2);
-
-      // BID: Sell tradeSize MON → get USDC
+      // BID: Estimate selling exact tradeSize MON -> USDC output
       const sellResult = await KuruSdk.CostEstimator.estimateMarketSell(
         this.provider, marketAddress, params, tradeSize
       );
       const usdcFromSell = parseFloat(sellResult.output.toString());
       if (!usdcFromSell || usdcFromSell <= 0) return null;
 
-      // FIX: Divide total USDC by MON sold to get price per MON
       const bidPrice = usdcFromSell / tradeSize;
 
-      // ASK: Spend that USDC to buy back MON
+      // ASK: Estimate spending that USDC to buy MON
       const buyResult = await KuruSdk.CostEstimator.estimateMarketBuy(
         this.provider, marketAddress, params, usdcFromSell
       );
@@ -41,20 +36,14 @@ class KuruMarket {
       if (!monFromBuy || monFromBuy <= 0) return null;
       const askPrice = usdcFromSell / monFromBuy;
 
-      const midPrice = (bidPrice + askPrice) / 2;
-      const spread = askPrice - bidPrice;
-      const spreadPct = midPrice > 0 ? (spread / midPrice) * 100 : 0;
-
       return {
         dex: this.name,
         label,
         marketAddress,
         bidPrice,
         askPrice,
-        midPrice,
-        spread,
-        spreadPct,
-        minSize,
+        usdcFromSell,
+        monFromBuy
       };
     } catch (err) {
       return null;
