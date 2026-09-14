@@ -1,8 +1,8 @@
 ﻿const { ethers } = require('ethers');
 const KuruSdk = require('@kuru-labs/kuru-sdk');
-const { PAIRS, SETTINGS, TOKENS } = require('./config');
+const { PAIRS, SETTINGS, TOKENS, UNISWAP } = require('./config');
 const KuruMarket = require('./dex/kuruMarket');
-const ZeroX = require('./dex/zeroX');
+const UniswapV3 = require('./dex/uniswapV3');
 const { sleep } = require('./utils/helpers');
 const logger = require('./utils/logger');
 
@@ -16,13 +16,17 @@ const WMON_ABI = [
   'function withdraw(uint256 amount)',
   'function balanceOf(address) view returns (uint256)'
 ];
+const UNI_ROUTER_ABI = [
+  'function exactInputSingle((address tokenIn, address tokenOut, uint24 fee, address recipient, uint256 amountIn, uint256 amountOutMinimum, uint160 sqrtPriceLimitX96)) external payable returns (uint256 amountOut)'
+];
 
 class Scanner {
   constructor(provider, signer = null) {
     this.provider = provider;
     this.signer = signer;
     this.kuru = new KuruMarket(provider);
-    this.zeroX = new ZeroX(provider);
+    this.uni = new UniswapV3(provider);
+    this.uniRouter = new ethers.Contract(UNISWAP.router, UNI_ROUTER_ABI, signer);
     this.stats = { trades: 0, failures: 0 };
     this.isTrading = false;
   }
@@ -45,13 +49,31 @@ class Scanner {
     try {
       const wallet = await this.signer.getAddress();
       const wmon = new ethers.Contract(TOKENS.WMON.address, WMON_ABI, this.signer);
-      const wmonBal = await wmon.balanceOf(wallet);
+      const usdc = new ethers.Contract(TOKENS.USDC.address, ERC20_ABI, this.signer);
       
+      // Auto-swap leftover USDC -> Native MON
+      const usdcBal = await usdc.balanceOf(wallet);
+      if (usdcBal.gt(ethers.utils.parseUnits("0.5", 6))) {
+        logger.trade(`Auto-recovering ${ethers.utils.formatUnits(usdcBal, 6)} USDC to MON via Uniswap V3...`);
+        await this._ensureAllowance(TOKENS.USDC.address, UNISWAP.router, usdcBal);
+        const swapTx = await this.uniRouter.exactInputSingle({
+          tokenIn: TOKENS.USDC.address,
+          tokenOut: TOKENS.WMON.address,
+          fee: 500,
+          recipient: wallet,
+          amountIn: usdcBal,
+          amountOutMinimum: 0,
+          sqrtPriceLimitX96: 0
+        }, { gasLimit: 350000 });
+        await swapTx.wait();
+      }
+
+      // Auto-unwrap leftover WMON -> Native MON
+      const wmonBal = await wmon.balanceOf(wallet);
       if (wmonBal.gt(ethers.utils.parseEther("0.1"))) {
-        logger.trade(`Auto-unwrapping ${ethers.utils.formatEther(wmonBal)} WMON to native MON...`);
+        logger.trade(`Auto-unwrapping ${ethers.utils.formatEther(wmonBal)} WMON to Native MON...`);
         const tx = await wmon.withdraw(wmonBal, { gasLimit: 150000 });
         await tx.wait();
-        logger.success(`Unwrapped to native MON!`);
       }
     } catch (err) {
       logger.warn(`Normalize balance error: ${err.message.slice(0, 60)}`);
@@ -87,43 +109,42 @@ class Scanner {
 
     for (const pair of PAIRS) {
       try {
-        const [kuruQ, zeroXQ] = await Promise.all([
+        const [kuruQ, uniQ] = await Promise.all([
           this.kuru.getQuote(pair.kuruMarket, pair.label, size),
-          this.zeroX.getPrice(pair.tokenIn, pair.tokenOut, size),
+          this.uni.getQuote(pair.tokenIn, pair.tokenOut, size, pair.uniFeeTier),
         ]);
         
-        if (!kuruQ || !zeroXQ) continue;
+        if (!kuruQ || !uniQ) continue;
 
-        // Spread calculations based on REAL depth quotes
-        const gapA = ((zeroXQ.price - kuruQ.askPrice) / kuruQ.askPrice) * 100;
-        const gapB = ((kuruQ.bidPrice - zeroXQ.price) / zeroXQ.price) * 100;
+        const gapA = ((uniQ.price - kuruQ.askPrice) / kuruQ.askPrice) * 100;
+        const gapB = ((kuruQ.bidPrice - uniQ.price) / uniQ.price) * 100;
 
-        logger.info(`${pair.label} [Size: ${size} MON] | Real Gaps: A:${gapA.toFixed(2)}% B:${gapB.toFixed(2)}%`);
+        logger.info(`${pair.label} [Size: ${size} MON] | On-Chain Gaps: A:${gapA.toFixed(2)}% B:${gapB.toFixed(2)}%`);
 
-        // Dir A: Sell 0x -> Buy Kuru (Only if guaranteed positive MON)
+        // Dir A: Sell Uniswap V3 -> Buy Kuru
         if (gapA >= SETTINGS.minArbPercent) {
-          const usdcFrom0x = size * zeroXQ.price;
-          const monFromKuru = usdcFrom0x / kuruQ.askPrice;
-          const expectedNetGain = monFromKuru - size;
+          const usdcFromUni = size * uniQ.price;
+          const monFromKuru = usdcFromUni / kuruQ.askPrice;
+          const expectedGain = monFromKuru - size;
 
-          if (expectedNetGain > 0.15) { // Must earn at least +0.15 MON net
+          if (expectedGain > 0.15) {
             this.isTrading = true;
-            logger.opportunity(`⚡ REAL Arb Found (Dir A): Gap +${gapA.toFixed(2)}% | Net: +${expectedNetGain.toFixed(3)} MON`);
-            await this._executeDirA(pair, kuruQ, size, monFromKuru);
+            logger.opportunity(`⚡ On-Chain Arb (Dir A: Sell Uni / Buy Kuru): Gap +${gapA.toFixed(2)}% | Net: +${expectedGain.toFixed(3)} MON`);
+            await this._executeDirA(pair, kuruQ, size);
             this.isTrading = false;
             await sleep(10000);
           }
         } 
-        // Dir B: Sell Kuru -> Buy 0x (Only if guaranteed positive MON)
+        // Dir B: Sell Kuru -> Buy Uniswap V3
         else if (gapB >= SETTINGS.minArbPercent) {
           const usdcFromKuru = kuruQ.usdcFromSell;
-          const monFrom0x = usdcFromKuru / zeroXQ.price;
-          const expectedNetGain = monFrom0x - size;
+          const monFromUni = usdcFromKuru / uniQ.price;
+          const expectedGain = monFromUni - size;
 
-          if (expectedNetGain > 0.15) { // Must earn at least +0.15 MON net
+          if (expectedGain > 0.15) {
             this.isTrading = true;
-            logger.opportunity(`⚡ REAL Arb Found (Dir B): Gap +${gapB.toFixed(2)}% | Net: +${expectedNetGain.toFixed(3)} MON`);
-            await this._executeDirB(pair, kuruQ, size, monFrom0x);
+            logger.opportunity(`⚡ On-Chain Arb (Dir B: Sell Kuru / Buy Uni): Gap +${gapB.toFixed(2)}% | Net: +${expectedGain.toFixed(3)} MON`);
+            await this._executeDirB(pair, kuruQ, size);
             this.isTrading = false;
             await sleep(10000);
           }
@@ -134,76 +155,102 @@ class Scanner {
     }
   }
 
-  async _executeDirA(pair, kuruQ, size, expectedMonBack) {
+  async _executeDirA(pair, kuruQ, size) {
     try {
       const wallet = await this.signer.getAddress();
       const wmon = new ethers.Contract(TOKENS.WMON.address, WMON_ABI, this.signer);
       const usdc = new ethers.Contract(pair.tokenOut.address, ERC20_ABI, this.signer);
       const monWei = ethers.utils.parseEther(size.toString());
 
+      // 1. Wrap MON -> WMON
       logger.trade(`Wrapping ${size} MON to WMON...`);
       await (await wmon.deposit({ value: monWei })).wait();
 
-      const usdcBalBefore = await usdc.balanceOf(wallet);
-      logger.trade(`[Leg 1] 0x Sell: Swapping ${size} WMON for USDC...`);
-      await this.zeroX.executeSwap(pair.tokenIn, pair.tokenOut, size.toString(), this.signer);
+      // 2. Leg 1: Sell WMON on Uniswap V3 Router
+      await this._ensureAllowance(TOKENS.WMON.address, UNISWAP.router, monWei);
+      const usdcBefore = await usdc.balanceOf(wallet);
       
-      const usdcBalAfter = await usdc.balanceOf(wallet);
-      const usdcReceived = usdcBalAfter.sub(usdcBalBefore);
-      if (usdcReceived.eq(0)) throw new Error("0x Leg 1 returned 0 USDC");
+      logger.trade(`[Leg 1] Uniswap V3 Sell: Swapping ${size} WMON for USDC...`);
+      const swapTx = await this.uniRouter.exactInputSingle({
+        tokenIn: TOKENS.WMON.address,
+        tokenOut: pair.tokenOut.address,
+        fee: pair.uniFeeTier,
+        recipient: wallet,
+        amountIn: monWei,
+        amountOutMinimum: 0,
+        sqrtPriceLimitX96: 0
+      }, { gasLimit: 350000 });
+      await swapTx.wait();
+
+      const usdcAfter = await usdc.balanceOf(wallet);
+      const usdcReceived = usdcAfter.sub(usdcBefore);
+      if (usdcReceived.eq(0)) throw new Error("Uniswap V1 returned 0 USDC");
 
       const usdcToSpend = ethers.utils.formatUnits(usdcReceived, 6);
       await this._ensureAllowance(pair.tokenOut.address, pair.kuruMarket, usdcReceived);
 
-      logger.trade(`[Leg 2] Kuru Buy: Spending ${usdcToSpend} USDC (Min return: ${size} MON)...`);
+      // 3. Leg 2: Buy MON on Kuru Order Book
+      logger.trade(`[Leg 2] Kuru Buy: Spending ${usdcToSpend} USDC for MON...`);
       const params = await this.kuru._getParams(pair.kuruMarket);
       const tx = await KuruSdk.IOC.placeMarket(this.signer, pair.kuruMarket, params, {
         approveTokens: false, 
         size: usdcToSpend, 
         isBuy: true,
-        minAmountOut: (size * 1.001).toFixed(4), // STRICT: Must receive AT LEAST initial size + 0.1%
+        minAmountOut: (size * 1.001).toFixed(4),
         isMargin: false, 
-        fillOrKill: true, // Revert if not completely filled at this price
+        fillOrKill: true,
         txOptions: { value: 0 }
       });
-      
       if (tx && tx.hash) await tx.wait();
 
       this.stats.trades++;
-      logger.success(`🎉 Profitable Cycle Complete! Trades: ${this.stats.trades}`);
+      logger.success(`🎉 100% On-Chain Cycle Complete! Total Successes: ${this.stats.trades}`);
     } catch (err) { 
       this.stats.failures++;
       logger.error(`Dir A Cancelled / Reverted: ${err.message.slice(0, 80)}`); 
     }
   }
 
-  async _executeDirB(pair, kuruQ, size, expectedMonBack) {
+  async _executeDirB(pair, kuruQ, size) {
     try {
       const wallet = await this.signer.getAddress();
       const usdc = new ethers.Contract(pair.tokenOut.address, ERC20_ABI, this.signer);
       const wmon = new ethers.Contract(TOKENS.WMON.address, WMON_ABI, this.signer);
 
-      const usdcBalBefore = await usdc.balanceOf(wallet);
+      // 1. Leg 1: Sell Native MON on Kuru
+      const usdcBefore = await usdc.balanceOf(wallet);
       logger.trade(`[Leg 1] Kuru Sell: Selling ${size} MON for USDC...`);
       const params = await this.kuru._getParams(pair.kuruMarket);
       const tx = await KuruSdk.IOC.placeMarket(this.signer, pair.kuruMarket, params, {
         approveTokens: false, 
         size: size.toString(), 
         isBuy: false,
-        minAmountOut: (kuruQ.usdcFromSell * 0.999).toFixed(6), // Strict fill on Kuru
+        minAmountOut: (kuruQ.usdcFromSell * 0.999).toFixed(6),
         isMargin: false, 
         fillOrKill: true
       });
       if (tx && tx.hash) await tx.wait();
 
-      const usdcBalAfter = await usdc.balanceOf(wallet);
-      const usdcReceived = usdcBalAfter.sub(usdcBalBefore);
-      if (usdcReceived.eq(0)) throw new Error("Kuru Leg 1 returned 0 USDC");
+      const usdcAfter = await usdc.balanceOf(wallet);
+      const usdcReceived = usdcAfter.sub(usdcBefore);
+      if (usdcReceived.eq(0)) throw new Error("Kuru returned 0 USDC");
 
-      const usdcToSpend = ethers.utils.formatUnits(usdcReceived, 6);
-      logger.trade(`[Leg 2] 0x Buy: Swapping ${usdcToSpend} USDC for WMON...`);
-      await this.zeroX.executeSwap(pair.tokenOut, pair.tokenIn, usdcToSpend, this.signer);
+      // 2. Leg 2: Buy WMON on Uniswap V3 Router
+      await this._ensureAllowance(pair.tokenOut.address, UNISWAP.router, usdcReceived);
+      logger.trade(`[Leg 2] Uniswap V3 Buy: Swapping ${ethers.utils.formatUnits(usdcReceived, 6)} USDC for WMON...`);
+      
+      const swapTx = await this.uniRouter.exactInputSingle({
+        tokenIn: pair.tokenOut.address,
+        tokenOut: TOKENS.WMON.address,
+        fee: pair.uniFeeTier,
+        recipient: wallet,
+        amountIn: usdcReceived,
+        amountOutMinimum: 0,
+        sqrtPriceLimitX96: 0
+      }, { gasLimit: 350000 });
+      await swapTx.wait();
 
+      // 3. Unwrap WMON -> Native MON
       const wmonBal = await wmon.balanceOf(wallet);
       if (wmonBal.gt(0)) {
         logger.trade(`Unwrapping ${ethers.utils.formatEther(wmonBal)} WMON to Native MON...`);
@@ -212,7 +259,7 @@ class Scanner {
       }
 
       this.stats.trades++;
-      logger.success(`🎉 Profitable Cycle Complete! Trades: ${this.stats.trades}`);
+      logger.success(`🎉 100% On-Chain Cycle Complete! Total Successes: ${this.stats.trades}`);
     } catch (err) { 
       this.stats.failures++;
       logger.error(`Dir B Cancelled / Reverted: ${err.message.slice(0, 80)}`); 
