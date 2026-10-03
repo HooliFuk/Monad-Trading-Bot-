@@ -83,29 +83,32 @@ class Scanner {
       const nativeBal = await T(this.provider.getBalance(wallet), 15000, 'native balance');
       const monFloat = parseFloat(ethers.utils.formatEther(nativeBal));
 
-      if (monFloat < 190.0) {
+      // Hard Circuit Breaker Stop: 50 MON floor
+      const safetyFloor = 50.0;
+      if (monFloat < safetyFloor) {
         if (!this.halted) {
           this.halted = true;
-          logger.error(`CIRCUIT BREAKER: balance ${monFloat.toFixed(2)} MON < 190 floor. Trading halted (process stays alive for monitoring).`);
+          logger.error(`CIRCUIT BREAKER: balance ${monFloat.toFixed(2)} MON < ${safetyFloor} floor. Trading halted.`);
         }
         return 0;
       }
+      this.halted = false;
 
       const gasReserve = ethers.utils.parseEther("5.0");
       if (nativeBal.lte(gasReserve)) return 0;
       const availMon = parseFloat(ethers.utils.formatEther(nativeBal.sub(gasReserve)));
       return Math.min(SETTINGS.maxTradeSize, Math.max(5, Math.floor(availMon)));
     } catch {
-      return 0; // RPC hiccup — skip this cycle instead of guessing
+      return 0;
     }
   }
 
   async scan() {
-    if (this.isTrading || this.halted) return;
+    if (this.isTrading) return;
 
     await this._normalizeBalances();
     const size = await this._getExecutableSize();
-    if (size < 5) return;
+    if (size < 5 || this.halted) return;
 
     for (const pair of PAIRS) {
       try {
@@ -117,12 +120,13 @@ class Scanner {
         if (!kuruQ || !uniQ) {
           this.nullQuoteStreak++;
           if (this.nullQuoteStreak % 20 === 0) {
-            logger.warn(`Quotes failing for ${this.nullQuoteStreak} consecutive scans — public RPC is likely rate-limiting this IP. Bot is alive, still watching.`);
+            logger.warn(`Quotes failing for ${this.nullQuoteStreak} consecutive scans (RPC rate limit).`);
           }
           continue;
         }
         this.nullQuoteStreak = 0;
 
+        // Dir B ONLY: Kuru Bid > Uniswap Price
         const gapB = ((kuruQ.bidPrice - uniQ.price) / uniQ.price) * 100;
         logger.info(`${pair.label} [Size: ${size} MON] | Safe Arb Gap (Dir B): ${gapB.toFixed(2)}%`);
 
@@ -137,7 +141,7 @@ class Scanner {
               logger.opportunity(`⚡ Safe Arb (Dir B): Gap +${gapB.toFixed(2)}% | Est Net: +${expectedGain.toFixed(3)} MON`);
               await this._executeDirB(pair, kuruQ, size, expectedGain);
             } finally {
-              this.isTrading = false; // ALWAYS released — can never stick
+              this.isTrading = false;
             }
             await sleep(10000);
           }
